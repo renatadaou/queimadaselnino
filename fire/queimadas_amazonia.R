@@ -6,9 +6,8 @@
 library(tidyverse)
 library(lubridate)
 library(sf)
-library(ggridges)   # install.packages("ggridges") se não tiver
 
-pasta <- "~/infoamazoniaelnino/fire"
+pasta <- "~/queimadaselnino/fire"
 saida <- file.path(pasta, "limpos")
 dir.create(saida, showWarnings = FALSE)
 dados <- file.path(pasta, "data")
@@ -33,10 +32,12 @@ anuais <- map_dfr(arquivos_anuais,
   )
 
 # 2026: formato do BDQueimadas (nomes de coluna diferentes)
-arquivo_2026 <- list.files(dados, pattern = "bdqueimadas_2026.*\\.csv$",
-                           full.names = TRUE)
+# 2026: um ou mais arquivos do BDQueimadas (podem se sobrepor nas datas)
+arquivos_2026 <- list.files(dados, pattern = "bdqueimadas_2026.*\\.csv$",
+                            full.names = TRUE)
 
-focos_2026 <- read_csv(arquivo_2026, col_types = cols(.default = "c")) |>
+focos_2026 <- map_dfr(arquivos_2026,
+                      ~ read_csv(.x, col_types = cols(.default = "c"))) |>
   filter(Satelite == "AQUA_M-T", Bioma == "Amazônia") |>
   transmute(
     data_hora = ymd_hms(DataHora),
@@ -44,7 +45,8 @@ focos_2026 <- read_csv(arquivo_2026, col_types = cols(.default = "c")) |>
     municipio = Municipio,
     lat       = as.numeric(Latitude),
     lon       = as.numeric(Longitude)
-  )
+  ) |>
+  distinct(data_hora, lat, lon, .keep_all = TRUE)  # remove os focos repetidos (1–2/10)
 
 focos <- bind_rows(anuais, focos_2026) |>
   mutate(ano = year(data_hora), mes = month(data_hora))
@@ -80,6 +82,16 @@ focos |>
 focos |>
   filter(format(data_hora, "%m%d") <= corte) |>
   count(ano, name = "focos_ate_a_data")
+
+# CSV 1b: focos por mês, incluindo outubro de 2026 (parcial, até ultima_data)
+focos |>
+  count(ano, mes, name = "focos") |>
+  complete(ano, mes = 1:12, fill = list(focos = 0)) |>
+  mutate(focos = if_else(ano == 2026 & mes > month(ultima_data), NA, focos)) |>
+  arrange(mes) |>
+  mutate(mes = meses[mes]) |>
+  pivot_wider(names_from = ano, values_from = focos) |>
+  write_csv(file.path(saida, "focos_mensais_com_out.csv"), na = "")
 
 # -----------------------------------------------------------------------------
 # 3. CSVs 2 e 3: focos por distância de Manaus
@@ -205,3 +217,21 @@ focos_out |>
 # Até que dia de outubro os CSVs 8 a 11 vão (mesmo dia em todos os anos)
 ultima_data
 
+# CSV 12: focos de 1º/ago a 14/out, somados, por ano (mesmo corte em todos os anos)
+focos |>
+  filter(format(data_hora, "%m%d") >= "0801",
+         format(data_hora, "%m%d") <= "1014") |>
+  count(ano, name = "focos_ago_a_14out") |>
+  complete(ano = 2021:2026, fill = list(focos_ago_a_14out = 0)) |>
+  write_csv(file.path(saida, "focos_ago_a_14out.csv"))
+
+# CSV 13: focos de 1º/ago a 14/out a até 300 km de Manaus, por ano
+focos_dist |>
+  filter(format(data_hora, "%m%d") <= "1014") |>
+  group_by(ano) |>
+  summarise(
+    focos_total   = n(),
+    focos_ate_300km = sum(dist_km <= 300),
+    pct_ate_300km = round(100 * focos_ate_300km / focos_total, 1)
+  ) |>
+  write_csv(file.path(saida, "focos_ago_a_14out_ate_300km.csv"))

@@ -1,21 +1,20 @@
 # =============================================================================
-# Piores dias de fumaça em Manaus — setembro de 2026
+# Piores dias e horas de fumaça em Manaus — setembro de 2026
 # Dados: PurpleAir, médias horárias de 15 sensores externos
 #
 # O que o script faz:
-#   1. Lê todos os CSVs baixados da API do PurpleAir (endpoint history/csv)
+#   1. Lê os CSVs baixados da PurpleAir e confere sensor, intervalo e bordas
 #   2. Descarta horas em que os dois canais do sensor (A e B) discordam
 #   3. Aplica a correção da EPA para PurpleAir (inclui ajuste para fumaça)
 #   4. Calcula a média diária por sensor no horário de Manaus (UTC-4)
 #   5. Junta os sensores num valor diário para a cidade e ranqueia os dias
+#   6. Lista as piores horas
 #
-# Saídas (na pasta "air", um nível acima de "data"):
-#   - qualidade_por_sensor.csv  -> quantas horas cada sensor teve e quantas
-#                                  foram descartadas
+# Saídas (na pasta "air"):
+#   - qualidade_por_sensor.csv  -> horas, descartes e dias válidos por sensor
 #   - diario_por_sensor.csv     -> média diária de cada sensor
-#   - ranking_manaus.csv        -> todos os dias de setembro, do pior ao melhor
-#   - picos_horarios.csv        -> todas as horas válidas, da pior à melhor,
-#                                  com valor bruto e corrigido
+#   - ranking_manaus.csv        -> dias de setembro, do pior ao melhor
+#   - picos_horarios.csv        -> horas válidas, da pior à melhor (corrigido)
 # =============================================================================
 
 library(dplyr)
@@ -25,11 +24,14 @@ library(purrr)
 
 # ---- Configuração ----------------------------------------------------------
 
-pasta_csv   <- "/Users/renatacarlosdaou/infoamazoniaelnino/air/data"  # CSVs baixados
-pasta_saida <- "/Users/renatacarlosdaou/infoamazoniaelnino/air"       # onde salvar os resultados
-limite_oms <- 15                 # diretriz da OMS para PM2.5 em 24h (µg/m³)
-min_horas  <- 18                 # horas válidas mínimas para o dia contar (75%)
-fuso       <- "America/Manaus"
+pasta_csv   <- "/Users/renatacarlosdaou/queimadaselnino/air/data"
+pasta_saida <- "/Users/renatacarlosdaou/queimadaselnino/air"
+limite_oms   <- 15    # diretriz da OMS para PM2.5 em 24h (µg/m³)
+min_horas    <- 18    # horas válidas mínimas para o dia contar (75%)
+limite_falha <- 1000  # canal acima disso é tratado como defeito (Plantower satura perto daqui)
+limite_calib <- 500   # bruto acima disso: correção com poucos dados, cite como "passou de X"
+fuso         <- "America/Manaus"
+horas_no_mes <- 30 * 24
 
 nomes_sensores <- tribble(
   ~sensor_index, ~nome,
@@ -48,9 +50,10 @@ nomes_sensores <- tribble(
   181825, "UEA_EducAIR_32",
   181835, "UEA_EducAIR_33",
   205957, "SEMA_MANAUS"
-)
+) %>%
+  mutate(sensor_index = as.integer(sensor_index))
 
-# ---- 1. Ler os CSVs ----------------------------------------------------------
+# ---- 1. Ler os CSVs e conferir -----------------------------------------------
 
 converter_hora <- function(x) {
   if (inherits(x, "POSIXct")) return(with_tz(x, "UTC"))
@@ -61,9 +64,11 @@ converter_hora <- function(x) {
 ler_csv <- function(arquivo) {
   d <- read_csv(arquivo, show_col_types = FALSE)
   
-  # Se o CSV não trouxer a coluna sensor_index, tenta tirar do nome do arquivo
+  # Sem coluna sensor_index: tenta o nome do arquivo (5 ou 6 dígitos, para não
+  # confundir com um ano). Logo abaixo tudo é conferido contra a lista.
   if (!"sensor_index" %in% names(d)) {
-    numero <- regmatches(basename(arquivo), regexpr("[0-9]{4,}", basename(arquivo)))
+    numero <- regmatches(basename(arquivo),
+                         regexpr("(?<![0-9])[0-9]{5,6}(?![0-9])", basename(arquivo), perl = TRUE))
     d$sensor_index <- if (length(numero) == 1) as.integer(numero) else NA_integer_
   }
   
@@ -78,29 +83,55 @@ ler_csv <- function(arquivo) {
 arquivos <- list.files(pasta_csv, pattern = "\\.csv$", full.names = TRUE)
 stopifnot("Nenhum CSV encontrado na pasta" = length(arquivos) > 0)
 
-bruto <- map_dfr(arquivos, ler_csv) %>%
-  distinct(sensor_index, hora_utc, .keep_all = TRUE) %>%   # remove horas repetidas
+lidos <- map_dfr(arquivos, ler_csv)
+
+# (a) Todo arquivo precisa ter um sensor da lista. Isso vem ANTES do distinct():
+#     dois arquivos com sensor NA seriam tratados como o mesmo sensor.
+fora_da_lista <- lidos %>%
+  filter(is.na(sensor_index) | !sensor_index %in% nomes_sensores$sensor_index) %>%
+  distinct(arquivo, sensor_index)
+if (nrow(fora_da_lista) > 0) {
+  print(fora_da_lista)
+  stop("Arquivo com sensor_index ausente ou fora da lista de sensores")
+}
+if (anyNA(lidos$hora_utc)) stop("Há horários que não foram lidos (time_stamp em formato inesperado)")
+
+sem_repeticao <- lidos %>%
+  distinct(sensor_index, hora_utc, .keep_all = TRUE)   # remove horas repetidas entre downloads
+
+# (b) Todos os arquivos precisam ser médias de 60 minutos
+intervalos <- sem_repeticao %>%
+  group_by(sensor_index) %>%
+  summarise(intervalo_min = median(diff(sort(as.numeric(hora_utc)))) / 60, .groups = "drop")
+if (any(abs(intervalos$intervalo_min - 60) > 1)) {
+  print(intervalos, n = Inf)
+  stop("Algum sensor não está em médias horárias: baixe de novo com média de 60 minutos")
+}
+
+bruto <- sem_repeticao %>%
   mutate(
     hora_local = with_tz(hora_utc, fuso),
     data       = as_date(hora_local)
   ) %>%
   filter(year(data) == 2026, month(data) == 9)
 
-if (any(is.na(bruto$sensor_index))) {
-  warning("Há arquivos sem sensor_index identificável: ",
-          paste(unique(bruto$arquivo[is.na(bruto$sensor_index)]), collapse = ", "))
+# (c) Bordas do mês: 1/9 e 30/9 no horário de Manaus precisam de 24 horas.
+#     Se faltar, pode ser download pedido em UTC (baixe até 01/10 04:00 UTC)
+#     ou só o sensor fora do ar.
+bordas <- bruto %>%
+  filter(data %in% as_date(c("2026-09-01", "2026-09-30"))) %>%
+  count(sensor_index, data, name = "horas") %>%
+  filter(horas < 24)
+if (nrow(bordas) > 0) {
+  message("Atenção: sensores com menos de 24 horas em 1/9 ou 30/9:")
+  print(bordas)
 }
 
 # ---- 2. Controle de qualidade (canais A e B) ---------------------------------
-# Passo 1: um canal com valor perto de 5000 está com defeito (é o valor de
-#          saturação/falha do sensor, não fumaça). Ele é ignorado.
-# Passo 2: se os dois canais estão bons, usa a média deles, mas só se
-#          concordarem (critério da EPA: descarta quando diferem em mais de
-#          5 µg/m³ E em mais de 70%).
-# Passo 3: se só um canal está bom, usa esse canal sozinho e marca a hora
-#          como "canal_unico", para você saber quanto do resultado depende disso.
-
-limite_falha <- 1000  # acima disso, o canal é tratado como defeito
+# Passo 1: canal acima de limite_falha está com defeito e é ignorado.
+# Passo 2: com os dois canais bons, usa a média, mas só se concordarem
+#          (critério da EPA: descarta quando diferem em mais de 5 µg/m³ E 70%).
+# Passo 3: com só um canal bom, usa esse canal e marca "canal_unico".
 
 horario <- bruto %>%
   rename(a = `pm2.5_cf_1_a`, b = `pm2.5_cf_1_b`, umidade = humidity) %>%
@@ -120,27 +151,16 @@ horario <- bruto %>%
     valida      = !is.na(pa_cf1) & !is.na(umidade)
   )
 
-qualidade <- horario %>%
-  group_by(sensor_index) %>%
-  summarise(
-    horas_no_arquivo  = n(),
-    horas_validas     = sum(valida),
-    horas_canal_unico = sum(valida & canal_unico),
-    horas_descartadas = sum(!valida),
-    canal_a_com_falha = sum(!a_ok),
-    canal_b_com_falha = sum(!b_ok),
-    .groups = "drop"
-  ) %>%
-  left_join(nomes_sensores, by = "sensor_index") %>%
-  relocate(nome, .after = sensor_index)
-
-print(qualidade, n = Inf)
-
 # ---- 3. Correção da EPA ------------------------------------------------------
-# Correção nacional da EPA (Barkjohn et al.), na versão estendida para fumaça
-# de incêndios, a mesma usada no mapa Fire and Smoke da AirNow.
-# pa = pm2.5_cf_1 (média dos canais, ou o canal bom); rh = umidade do sensor.
+# Correção nacional da EPA (Barkjohn et al.), versão estendida para fumaça,
+# a mesma do mapa Fire and Smoke da AirNow.
 # Atenção: foi calibrada nos EUA. Para Manaus, trate como estimativa.
+#
+# Como a correção mexe nos números:
+#   - abaixo de ~340 µg/m³ (bruto), o corrigido é MENOR que o bruto
+#     (ex.: bruto 40 -> corrigido ~25). Citar o bruto infla o valor.
+#   - acima de ~340, o corrigido passa a ser maior que o bruto.
+#   - acima de ~500 há pouca calibração: cite "passou de X".
 
 corrigir_epa <- function(pa, rh) {
   w1 <- pa / 20 - 3 / 2
@@ -176,15 +196,15 @@ diario_sensor <- horario_valido %>%
   relocate(nome, .after = sensor_index)
 
 # ---- 5. Valor diário da cidade e ranking -------------------------------------
-# Usa a MEDIANA entre sensores: um sensor com problema não puxa o resultado.
-# O máximo mostra o bairro mais afetado naquele dia.
+# MEDIANA entre sensores: um sensor com problema não puxa o resultado.
+# O máximo mostra o sensor mais afetado naquele dia.
 
 ranking <- diario_sensor %>%
   group_by(data) %>%
   summarise(
-    sensores_validos   = n(),
-    pm25_mediana       = median(pm25_media),
-    pm25_max_sensor    = max(pm25_media),
+    sensores_validos    = n(),
+    pm25_mediana        = median(pm25_media),
+    pm25_max_sensor     = max(pm25_media),
     sensor_mais_afetado = nome[which.max(pm25_media)],
     .groups = "drop"
   ) %>%
@@ -200,35 +220,61 @@ cat("Dias acima do limite da OMS:", sum(ranking$acima_oms), "\n\n")
 cat("10 piores dias (mediana entre sensores, µg/m³):\n")
 print(ranking %>% slice_head(n = 10), width = Inf)
 
-# Dias com poucos sensores merecem cautela na matéria
 poucos <- ranking %>% filter(sensores_validos < 5)
 if (nrow(poucos) > 0) {
   cat("\nAtenção: dias com menos de 5 sensores válidos:\n")
   print(poucos %>% select(data, sensores_validos, pm25_mediana))
 }
 
-# ---- 5b. Piores horas ----------------------------------------------------------
-# Médias de uma hora inteira (não picos de minutos), só de horas válidas.
-# pm25_bruto = valor do sensor sem correção; pm25_corrigido = com correção EPA.
-# Acima de ~260 a correção AUMENTA o valor e tem menos calibração: na matéria,
-# é mais seguro citar o bruto ou dizer "passou de X".
+# ---- 6. Piores horas -----------------------------------------------------------
+# Médias de uma hora inteira (não picos de minutos), só de horas válidas,
+# ordenadas pelo valor CORRIGIDO, que é o que deve ir para a matéria.
+# fora_da_calibracao = TRUE: cite como "passou de X" em vez do número exato.
 
 picos <- horario_valido %>%
   left_join(nomes_sensores, by = "sensor_index") %>%
-  arrange(desc(pa_cf1)) %>%
+  arrange(desc(pm25)) %>%
   transmute(
     nome, sensor_index,
-    hora_manaus = format(hora_local, "%Y-%m-%d %H:%M"),  # texto no horário local
-    
-    canal_a = a, canal_b = b, canal_unico,
-    pm25_bruto     = round(pa_cf1, 1),
-    pm25_corrigido = round(pm25, 1)
+    hora_manaus        = format(hora_local, "%Y-%m-%d %H:%M"),  # horário local
+    canal_a = a, canal_b = b, canal_unico, umidade,
+    pm25_bruto         = round(pa_cf1, 1),
+    pm25_corrigido     = round(pm25, 1),
+    fora_da_calibracao = pa_cf1 > limite_calib
   )
 
-cat("\n20 piores horas (média horária por sensor, µg/m³):\n")
+cat("\n20 piores horas (média horária por sensor, µg/m³, corrigido):\n")
 print(picos %>% slice_head(n = 20), width = Inf)
 
-# ---- 6. Exportar -------------------------------------------------------------
+# ---- 7. Qualidade por sensor -------------------------------------------------
+# Inclui os 15 sensores, mesmo os que não trouxeram nenhuma hora em setembro.
+
+qualidade <- horario %>%
+  group_by(sensor_index) %>%
+  summarise(
+    horas_no_arquivo  = n(),
+    horas_validas     = sum(valida),
+    horas_canal_unico = sum(valida & canal_unico),
+    horas_descartadas = sum(!valida),
+    canal_a_com_falha = sum(!a_ok),
+    canal_b_com_falha = sum(!b_ok),
+    canais_discordam  = sum(a_ok & b_ok & !concordam),
+    umidade_ausente   = sum(is.na(umidade)),
+    .groups = "drop"
+  ) %>%
+  left_join(diario_sensor %>% count(sensor_index, name = "dias_validos"),
+            by = "sensor_index") %>%
+  right_join(nomes_sensores, by = "sensor_index") %>%
+  mutate(
+    across(-c(sensor_index, nome), \(x) coalesce(x, 0L)),
+    horas_faltando = horas_no_mes - horas_no_arquivo
+  ) %>%
+  relocate(nome, .after = sensor_index) %>%
+  arrange(desc(horas_validas))
+
+print(qualidade, n = Inf, width = Inf)
+
+# ---- 8. Exportar -------------------------------------------------------------
 
 write_csv(qualidade,     file.path(pasta_saida, "qualidade_por_sensor.csv"))
 write_csv(diario_sensor, file.path(pasta_saida, "diario_por_sensor.csv"))
